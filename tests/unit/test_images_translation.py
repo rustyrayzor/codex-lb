@@ -128,6 +128,30 @@ class TestImagesGenerationToResponsesRequest:
         assert responses.model == "gpt-5.5"
         assert _tool(responses)["model"] == "gpt-image-2"
 
+    def test_fanout_requests_are_single_image_children_with_stable_indexes(self) -> None:
+        payload = V1ImagesGenerationsRequest.model_validate(
+            {
+                "model": "gpt-image-2",
+                "prompt": "four sticker variants",
+                "n": 4,
+                "size": "1024x1024",
+                "quality": "low",
+            }
+        )
+        children = images_service.images_generation_fanout_to_responses_requests(payload, host_model="gpt-5.5")
+
+        assert [child.output_index for child in children] == [0, 1, 2, 3]
+        prompt_cache_keys = [child.payload.prompt_cache_key for child in children]
+        assert len(set(prompt_cache_keys)) == 4
+        for index, child in enumerate(children):
+            assert child.payload.prompt_cache_key is not None
+            assert child.payload.prompt_cache_key.endswith(f":{index}")
+            assert child.payload.stream is True
+            tool = _tool(child.payload)
+            assert tool["type"] == "image_generation"
+            assert tool["model"] == "gpt-image-2"
+            assert "n" not in tool
+
 
 class TestImagesEditToResponsesRequest:
     def test_single_image_edit_payload(self) -> None:

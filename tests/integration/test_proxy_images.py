@@ -9,6 +9,7 @@ translation -> public response shape pipeline.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from typing import Any, cast
@@ -73,6 +74,10 @@ def _disable_http_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
         proxy_upstream_websocket_connect_limit=64,
         proxy_response_create_limit=64,
         proxy_compact_response_create_limit=16,
+        images_max_n=4,
+        images_request_parallelism=4,
+        images_global_in_flight=8,
+        images_per_account_in_flight=1,
     )
     dashboard_settings = DashboardSettings(
         id=1,
@@ -543,10 +548,168 @@ async def test_images_generations_falls_back_to_default_model_when_omitted(async
 
 
 @pytest.mark.asyncio
-async def test_images_generations_rejects_n_greater_than_one(async_client):
+async def test_images_generations_fans_out_n_greater_than_one_in_order(async_client, monkeypatch):
+    await _import_account(async_client, "acc_images_fanout", "img-fanout@example.com")
+
+    calls: list[tuple[int, Any]] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del headers, access_token, account_id, base_url, raise_for_status, kwargs
+        assert payload.prompt_cache_key is not None
+        index = int(payload.prompt_cache_key.rsplit(":", 1)[1])
+        calls.append((index, payload))
+        # Complete later indexes first; the public data array must still be
+        # ordered by requested output index.
+        await asyncio.sleep((3 - index) * 0.01)
+        yield _sse(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "image_generation_call",
+                    "id": f"ig_fanout_{index}",
+                    "status": "completed",
+                    "result": f"B64_{index}",
+                    "revised_prompt": f"variant {index}",
+                    "size": "1024x1024",
+                    "quality": "low",
+                    "background": "auto",
+                    "output_format": "png",
+                },
+            }
+        )
+        yield _sse(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": f"resp_fanout_{index}",
+                    "object": "response",
+                    "status": "completed",
+                    "tool_usage": {
+                        "image_gen": {
+                            "input_tokens": index + 1,
+                            "output_tokens": (index + 1) * 10,
+                        }
+                    },
+                },
+            }
+        )
+
+    async def fake_ensure_fresh(self, account, **kwargs):
+        del self, kwargs
+        return account
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh)
+
     response = await async_client.post(
         "/v1/images/generations",
-        json={"model": "gpt-image-2", "prompt": "x", "n": 2},
+        json={
+            "model": "gpt-image-2",
+            "prompt": "four sticker variants",
+            "n": 4,
+            "size": "1024x1024",
+            "quality": "low",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [entry["b64_json"] for entry in body["data"]] == ["B64_0", "B64_1", "B64_2", "B64_3"]
+    assert [entry["revised_prompt"] for entry in body["data"]] == [
+        "variant 0",
+        "variant 1",
+        "variant 2",
+        "variant 3",
+    ]
+    assert body["usage"] == {"input_tokens": 10, "output_tokens": 100, "total_tokens": 110}
+    assert sorted(index for index, _ in calls) == [0, 1, 2, 3]
+    for _, payload in calls:
+        image_tool = cast(dict[str, Any], cast(list[Any], payload.tools)[0])
+        assert "n" not in image_tool
+
+
+@pytest.mark.asyncio
+async def test_images_generations_streaming_fanout_emits_ordered_completed_events(async_client, monkeypatch):
+    await _import_account(async_client, "acc_images_stream_fanout", "img-stream-fanout@example.com")
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del headers, access_token, account_id, base_url, raise_for_status, kwargs
+        assert payload.prompt_cache_key is not None
+        index = int(payload.prompt_cache_key.rsplit(":", 1)[1])
+        await asyncio.sleep((1 - index) * 0.01)
+        yield _sse(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "image_generation_call",
+                    "id": f"ig_stream_fanout_{index}",
+                    "status": "completed",
+                    "result": f"STREAM_B64_{index}",
+                    "revised_prompt": f"stream variant {index}",
+                },
+            }
+        )
+        yield _sse(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": f"resp_stream_fanout_{index}",
+                    "tool_usage": {"image_gen": {"input_tokens": 1, "output_tokens": index + 2}},
+                },
+            }
+        )
+
+    async def fake_ensure_fresh(self, account, **kwargs):
+        del self, kwargs
+        return account
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh)
+
+    async with async_client.stream(
+        "POST",
+        "/v1/images/generations",
+        json={
+            "model": "gpt-image-2",
+            "prompt": "two stream variants",
+            "n": 2,
+            "stream": True,
+            "size": "1024x1024",
+            "quality": "low",
+        },
+    ) as resp:
+        assert resp.status_code == 200
+        body_lines = [line async for line in resp.aiter_lines()]
+
+    payloads: list[dict[str, object]] = []
+    last_done = False
+    for line in body_lines:
+        if not line:
+            continue
+        if line.strip() == "data: [DONE]":
+            last_done = True
+            continue
+        if line.startswith("data: "):
+            payloads.append(json.loads(line[len("data: ") :]))
+
+    assert last_done is True
+    assert [payload["type"] for payload in payloads] == [
+        "image_generation.completed",
+        "image_generation.completed",
+    ]
+    assert [payload["b64_json"] for payload in payloads] == ["STREAM_B64_0", "STREAM_B64_1"]
+    assert [payload["output_index"] for payload in payloads] == [0, 1]
+    assert "usage" not in payloads[0]
+    assert payloads[1]["usage"] == {"input_tokens": 2, "output_tokens": 5, "total_tokens": 7}
+
+
+@pytest.mark.asyncio
+async def test_images_generations_rejects_n_above_configured_cap(async_client):
+    response = await async_client.post(
+        "/v1/images/generations",
+        json={"model": "gpt-image-2", "prompt": "x", "n": 5},
     )
     assert response.status_code == 400
     body = response.json()

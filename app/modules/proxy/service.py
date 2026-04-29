@@ -284,6 +284,8 @@ class ProxyService:
                 websocket_connect_limit=settings.proxy_upstream_websocket_connect_limit,
                 response_create_limit=settings.proxy_response_create_limit,
                 compact_response_create_limit=settings.proxy_compact_response_create_limit,
+                image_global_in_flight=getattr(settings, "images_global_in_flight", 0),
+                image_per_account_in_flight=getattr(settings, "images_per_account_in_flight", 0),
                 admission_wait_timeout_seconds=getattr(
                     settings,
                     "proxy_admission_wait_timeout_seconds",
@@ -304,6 +306,7 @@ class ProxyService:
         api_key_reservation: ApiKeyUsageReservationData | None = None,
         suppress_text_done_events: bool = False,
         request_transport: str = _REQUEST_TRANSPORT_HTTP,
+        image_generation_admission: bool = False,
     ) -> AsyncIterator[str]:
         _maybe_log_proxy_request_payload("stream", payload, headers)
         filtered = filter_inbound_headers(headers)
@@ -317,6 +320,7 @@ class ProxyService:
             api_key_reservation=api_key_reservation,
             suppress_text_done_events=suppress_text_done_events,
             request_transport=request_transport,
+            image_generation_admission=image_generation_admission,
         )
 
     def stream_http_responses(
@@ -6391,6 +6395,7 @@ class ProxyService:
         api_key_reservation: ApiKeyUsageReservationData | None,
         suppress_text_done_events: bool,
         request_transport: str,
+        image_generation_admission: bool = False,
     ) -> AsyncIterator[str]:
         request_id = ensure_request_id()
         start = time.monotonic()
@@ -6705,6 +6710,7 @@ class ProxyService:
                                 upstream_stream_transport=upstream_stream_transport,
                                 request_transport=request_transport,
                                 preferred_account_id=preferred_account_id,
+                                image_generation_admission=image_generation_admission,
                             ):
                                 yield line
                         except (_TransientStreamError, ProxyResponseError) as tex:
@@ -6912,6 +6918,7 @@ class ProxyService:
                                 suppress_text_done_events=suppress_text_done_events,
                                 upstream_stream_transport=upstream_stream_transport,
                                 request_transport=request_transport,
+                                image_generation_admission=image_generation_admission,
                             ):
                                 yield line
                         finally:
@@ -7031,6 +7038,7 @@ class ProxyService:
         upstream_stream_transport: str | None,
         request_transport: str,
         preferred_account_id: str | None = None,
+        image_generation_admission: bool = False,
     ) -> AsyncIterator[str]:
         account_id_value = account.id
         access_token = self._encryptor.decrypt(account.access_token_encrypted)
@@ -7050,8 +7058,11 @@ class ProxyService:
         saw_text_delta = False
         latency_first_token_ms: int | None = None
         response_create_lease = AdmissionLease(None)
+        image_generation_lease = AdmissionLease(None)
 
         try:
+            if image_generation_admission:
+                image_generation_lease = await self._get_work_admission().acquire_image_generation(account_id_value)
             response_create_lease = await self._get_work_admission().acquire_response_create()
             if upstream_stream_transport is not None:
                 stream = core_stream_responses(
@@ -7290,6 +7301,7 @@ class ProxyService:
             raise
         finally:
             response_create_lease.release()
+            image_generation_lease.release()
             input_tokens = usage.input_tokens if usage else None
             output_tokens = usage.output_tokens if usage else None
             cached_input_tokens = (

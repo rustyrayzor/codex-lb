@@ -39,6 +39,25 @@ class AdmissionLease:
 
 
 @dataclass(slots=True)
+class AdmissionLeaseGroup:
+    _leases: list[AdmissionLease]
+    _released: bool = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        for lease in reversed(self._leases):
+            lease.release()
+
+    def __enter__(self) -> AdmissionLeaseGroup:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.release()
+
+
+@dataclass(slots=True)
 class _AdmissionGate:
     semaphore: asyncio.Semaphore
     wait_timeout_seconds: float
@@ -52,12 +71,19 @@ class WorkAdmissionController:
         websocket_connect_limit: int,
         response_create_limit: int,
         compact_response_create_limit: int,
+        image_global_in_flight: int = 0,
+        image_per_account_in_flight: int = 0,
         admission_wait_timeout_seconds: float = _DEFAULT_ADMISSION_WAIT_TIMEOUT_SECONDS,
     ) -> None:
         self._token_refresh = _make_gate(token_refresh_limit, admission_wait_timeout_seconds)
         self._websocket_connect = _make_gate(websocket_connect_limit, admission_wait_timeout_seconds)
         self._response_create = _make_gate(response_create_limit, admission_wait_timeout_seconds)
         self._compact_response_create = _make_gate(compact_response_create_limit, admission_wait_timeout_seconds)
+        self._image_global = _make_gate(image_global_in_flight, admission_wait_timeout_seconds)
+        self._image_per_account_limit = image_per_account_in_flight
+        self._image_wait_timeout_seconds = admission_wait_timeout_seconds
+        self._image_account_gates: dict[str, _AdmissionGate] = {}
+        self._image_account_gates_lock = asyncio.Lock()
 
     async def acquire_token_refresh(self) -> AdmissionLease:
         return await self._acquire(self._token_refresh, stage="token_refresh")
@@ -69,6 +95,27 @@ class WorkAdmissionController:
         semaphore = self._compact_response_create if compact else self._response_create
         stage = "compact_response_create" if compact else "response_create"
         return await self._acquire(semaphore, stage=stage)
+
+    async def acquire_image_generation(self, account_id: str) -> AdmissionLease | AdmissionLeaseGroup:
+        global_lease = await self._acquire(self._image_global, stage="image_generation_global")
+        try:
+            account_gate = await self._image_account_gate(account_id)
+            account_lease = await self._acquire(account_gate, stage="image_generation_account")
+        except Exception:
+            global_lease.release()
+            raise
+        return AdmissionLeaseGroup([global_lease, account_lease])
+
+    async def _image_account_gate(self, account_id: str) -> _AdmissionGate | None:
+        if self._image_per_account_limit <= 0:
+            return None
+        async with self._image_account_gates_lock:
+            gate = self._image_account_gates.get(account_id)
+            if gate is None:
+                gate = _make_gate(self._image_per_account_limit, self._image_wait_timeout_seconds)
+                assert gate is not None
+                self._image_account_gates[account_id] = gate
+            return gate
 
     async def _acquire(self, gate: _AdmissionGate | None, *, stage: str) -> AdmissionLease:
         if gate is None:

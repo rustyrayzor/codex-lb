@@ -17,8 +17,10 @@ import binascii
 import logging
 import re
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
+from dataclasses import dataclass
 from typing import Final, cast
+from uuid import uuid4
 
 from app.core.config.settings import get_settings
 from app.core.errors import OpenAIErrorEnvelope, openai_error
@@ -80,6 +82,12 @@ _DATA_URL_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^data:(?P<mime>[^;]+);base64,(?P<b64>.+)$",
     re.DOTALL,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ImageGenerationFanoutRequest:
+    output_index: int
+    payload: ResponsesRequest
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +216,22 @@ def images_generation_to_responses_request(
     )
 
 
+def images_generation_fanout_to_responses_requests(
+    payload: V1ImagesGenerationsRequest,
+    *,
+    host_model: str,
+) -> list[ImageGenerationFanoutRequest]:
+    """Build one single-image Responses request per public Images output."""
+    fanout_id = uuid4().hex
+    requests: list[ImageGenerationFanoutRequest] = []
+    for output_index in range(payload.n):
+        child_payload = payload.model_copy(update={"n": 1})
+        responses_payload = images_generation_to_responses_request(child_payload, host_model=host_model)
+        responses_payload.prompt_cache_key = f"image-generation:{fanout_id}:{output_index}"
+        requests.append(ImageGenerationFanoutRequest(output_index=output_index, payload=responses_payload))
+    return requests
+
+
 def images_edit_to_responses_request(
     payload: V1ImagesEditsForm,
     *,
@@ -325,6 +349,7 @@ def validate_generations_payload(payload: V1ImagesGenerationsRequest) -> V1Image
         partial_images=payload.partial_images,
         output_compression=payload.output_compression,
         images_max_partial_images=settings.images_max_partial_images,
+        images_max_n=settings.images_max_n,
     )
     if payload.model != resolved_model:
         # Pydantic models are immutable by default; build a copy with the
@@ -353,6 +378,7 @@ def validate_edits_payload(payload: V1ImagesEditsForm) -> V1ImagesEditsForm:
         partial_images=payload.partial_images,
         output_compression=payload.output_compression,
         images_max_partial_images=settings.images_max_partial_images,
+        images_max_n=1,
     )
     if payload.model != resolved_model:
         return payload.model_copy(update={"model": resolved_model})
@@ -539,6 +565,69 @@ def _extract_cached_input_tokens(usage: V1ImageUsage) -> int | None:
     if isinstance(raw, float):
         return int(raw)
     return None
+
+
+def sum_image_usages(usages: list[V1ImageUsage | None]) -> V1ImageUsage | None:
+    input_tokens = _sum_optional_int(usage.input_tokens for usage in usages if usage is not None)
+    output_tokens = _sum_optional_int(usage.output_tokens for usage in usages if usage is not None)
+    total_tokens = _sum_optional_int(usage.total_tokens for usage in usages if usage is not None)
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    input_details = _sum_usage_detail_maps(
+        usage.input_tokens_details for usage in usages if usage is not None and usage.input_tokens_details is not None
+    )
+    output_details = _sum_usage_detail_maps(
+        usage.output_tokens_details for usage in usages if usage is not None and usage.output_tokens_details is not None
+    )
+    if (
+        input_tokens is None
+        and output_tokens is None
+        and total_tokens is None
+        and input_details is None
+        and output_details is None
+    ):
+        return None
+    return V1ImageUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        input_tokens_details=input_details,
+        output_tokens_details=output_details,
+    )
+
+
+def image_usage_cached_input_tokens(usage: V1ImageUsage | None) -> int | None:
+    if usage is None:
+        return None
+    return _extract_cached_input_tokens(usage)
+
+
+def _sum_optional_int(values: Iterable[JsonValue | None]) -> int | None:
+    total = 0
+    seen = False
+    for value in values:
+        coerced = _coerce_int(value)
+        if coerced is None:
+            continue
+        total += coerced
+        seen = True
+    return total if seen else None
+
+
+def _sum_usage_detail_maps(values: Iterable[Mapping[str, JsonValue]]) -> dict[str, JsonValue] | None:
+    totals: dict[str, int] = {}
+    passthrough: dict[str, JsonValue] = {}
+    for value in values:
+        for key, detail_value in value.items():
+            coerced = _coerce_int(detail_value)
+            if coerced is None:
+                passthrough.setdefault(str(key), detail_value)
+                continue
+            totals[str(key)] = totals.get(str(key), 0) + coerced
+    result: dict[str, JsonValue] = {key: value for key, value in totals.items()}
+    for key, value in passthrough.items():
+        result.setdefault(key, value)
+    return result or None
 
 
 def _build_partial_image_event(payload: Mapping[str, JsonValue], *, event_type: str) -> dict[str, JsonValue] | None:
@@ -1030,13 +1119,17 @@ def make_not_found_error(message: str) -> OpenAIErrorEnvelope:
 __all__ = [
     "collect_responses_stream_for_images",
     "decode_data_url",
+    "ImageGenerationFanoutRequest",
+    "image_usage_cached_input_tokens",
     "images_edit_to_responses_request",
+    "images_generation_fanout_to_responses_requests",
     "images_generation_to_responses_request",
     "images_response_from_responses",
     "is_supported_image_model",
     "make_invalid_request_error",
     "make_not_found_error",
     "resolve_public_image_model",
+    "sum_image_usages",
     "translate_responses_stream_to_images_stream",
     "validate_edits_payload",
     "validate_generations_payload",

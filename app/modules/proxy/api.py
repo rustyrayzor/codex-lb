@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Final, cast
 
@@ -174,6 +176,21 @@ _IMAGE_ERROR_CODE_STATUS: Final[dict[str, int]] = {
     "rate_limit_exceeded": 429,
     "insufficient_quota": 429,
 }
+
+
+@dataclass(slots=True)
+class _ImageFanoutChildResult:
+    output_index: int
+    image_response: V1ImageResponse | None = None
+    error_envelope: OpenAIErrorEnvelope | None = None
+    status_code: int | None = None
+
+
+@dataclass(slots=True)
+class _ImageFanoutAggregateResult:
+    image_response: V1ImageResponse | None = None
+    error_envelope: OpenAIErrorEnvelope | None = None
+    status_code: int | None = None
 
 
 @router.post(
@@ -846,6 +863,18 @@ async def _proxy_images_generation_request(
         request_service_tier=None,
     )
 
+    if payload.n > 1:
+        return await _proxy_images_generation_fanout_request(
+            request=request,
+            payload=payload,
+            context=context,
+            api_key=api_key,
+            reservation=reservation,
+            rate_limit_headers=rate_limit_headers,
+            public_model=public_model,
+            host_model=host_model,
+        )
+
     try:
         responses_payload = images_service_module.images_generation_to_responses_request(payload, host_model=host_model)
     except ValidationError as exc:
@@ -877,6 +906,7 @@ async def _proxy_images_generation_request(
         openai_cache_affinity=True,
         api_key=api_key,
         api_key_reservation=None,
+        image_generation_admission=True,
     )
 
     # ``images_service`` populates ``response_id`` once the upstream stream
@@ -991,6 +1021,212 @@ async def _proxy_images_generation_request(
     )
 
 
+async def _proxy_images_generation_fanout_request(
+    *,
+    request: Request,
+    payload: V1ImagesGenerationsRequest,
+    context: ProxyContext,
+    api_key: ApiKeyData | None,
+    reservation: ApiKeyUsageReservationData | None,
+    rate_limit_headers: Mapping[str, str],
+    public_model: str,
+    host_model: str,
+) -> Response:
+    try:
+        child_requests = images_service_module.images_generation_fanout_to_responses_requests(
+            payload,
+            host_model=host_model,
+        )
+    except ValidationError as exc:
+        await _release_reservation(reservation)
+        return _logged_error_json_response(
+            request,
+            400,
+            openai_validation_error(exc),
+            headers=rate_limit_headers,
+        )
+
+    parallelism = max(1, min(proxy_service_module.get_settings().images_request_parallelism, len(child_requests)))
+    semaphore = asyncio.Semaphore(parallelism)
+    reservation_done = False
+    tasks: list[asyncio.Task[_ImageFanoutChildResult]] = []
+
+    async def _run_child(
+        child: images_service_module.ImageGenerationFanoutRequest,
+    ) -> _ImageFanoutChildResult:
+        async with semaphore:
+            captured: dict[str, object] = {}
+            upstream = context.service.stream_responses(
+                child.payload,
+                request.headers,
+                codex_session_affinity=False,
+                propagate_http_errors=True,
+                openai_cache_affinity=True,
+                api_key=api_key,
+                api_key_reservation=None,
+                image_generation_admission=True,
+            )
+            try:
+                response_payload, error_envelope = await images_service_module.collect_responses_stream_for_images(
+                    upstream,
+                    captured=captured,
+                )
+            except ProxyResponseError as exc:
+                error_payload = (
+                    exc.payload
+                    if isinstance(exc.payload, dict)
+                    else openai_error(
+                        "upstream_error",
+                        "Upstream image generation failed",
+                        error_type="server_error",
+                    )
+                )
+                return _ImageFanoutChildResult(
+                    output_index=child.output_index,
+                    error_envelope=cast(OpenAIErrorEnvelope, error_payload),
+                    status_code=exc.status_code,
+                )
+            finally:
+                response_id = captured.get("response_id")
+                if response_id and isinstance(response_id, str):
+                    await context.service.rewrite_request_log_model(response_id, public_model)
+
+            if error_envelope is not None:
+                return _ImageFanoutChildResult(
+                    output_index=child.output_index,
+                    error_envelope=error_envelope,
+                    status_code=_status_for_image_error_envelope(error_envelope),
+                )
+            assert response_payload is not None
+            images_result = images_service_module.images_response_from_responses(response_payload)
+            if not isinstance(images_result, V1ImageResponse):
+                return _ImageFanoutChildResult(
+                    output_index=child.output_index,
+                    error_envelope=images_result,
+                    status_code=_status_for_image_error_envelope(images_result),
+                )
+            return _ImageFanoutChildResult(output_index=child.output_index, image_response=images_result)
+
+    async def _collect_ordered_response() -> _ImageFanoutAggregateResult:
+        tasks.clear()
+        tasks.extend(asyncio.create_task(_run_child(child)) for child in child_requests)
+        results_by_index: dict[int, V1ImageResponse] = {}
+        for completed in asyncio.as_completed(tasks):
+            result = await completed
+            if result.error_envelope is not None:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                return _ImageFanoutAggregateResult(
+                    error_envelope=result.error_envelope,
+                    status_code=result.status_code or _status_for_image_error_envelope(result.error_envelope),
+                )
+            assert result.image_response is not None
+            results_by_index[result.output_index] = result.image_response
+
+        ordered_responses = [results_by_index[index] for index in range(payload.n)]
+        data = [response.data[0] for response in ordered_responses]
+        usage = images_service_module.sum_image_usages([response.usage for response in ordered_responses])
+        return _ImageFanoutAggregateResult(
+            image_response=V1ImageResponse(
+                created=int(time.time()),
+                data=data,
+                usage=usage,
+            )
+        )
+
+    if payload.stream:
+
+        async def _stream_fanout() -> AsyncIterator[bytes]:
+            stream_reservation_done = False
+            try:
+                aggregate = await _collect_ordered_response()
+                if aggregate.error_envelope is not None:
+                    event: dict[str, JsonValue] = {"type": "error"}
+                    for key, value in aggregate.error_envelope.items():
+                        event[key] = cast(JsonValue, value)
+                    yield format_sse_event(event).encode("utf-8")
+                    yield b"data: [DONE]\n\n"
+                    await _release_reservation(reservation)
+                    stream_reservation_done = True
+                    return
+
+                assert aggregate.image_response is not None
+                images_result = aggregate.image_response
+                last_index = len(images_result.data) - 1
+                for index, image in enumerate(images_result.data):
+                    event = {
+                        "type": "image_generation.completed",
+                        "created_at": images_result.created,
+                        "b64_json": image.b64_json,
+                        "output_index": index,
+                    }
+                    if image.revised_prompt is not None:
+                        event["revised_prompt"] = image.revised_prompt
+                    if index == last_index and images_result.usage is not None:
+                        event["usage"] = images_result.usage.model_dump(mode="json", exclude_none=True)
+                    yield format_sse_event(cast(dict[str, JsonValue], event)).encode("utf-8")
+
+                await _finalize_image_reservation(
+                    reservation,
+                    model=public_model,
+                    input_tokens=images_result.usage.input_tokens if images_result.usage is not None else None,
+                    output_tokens=images_result.usage.output_tokens if images_result.usage is not None else None,
+                    cached_input_tokens=images_service_module.image_usage_cached_input_tokens(images_result.usage),
+                )
+                stream_reservation_done = True
+                yield b"data: [DONE]\n\n"
+            except asyncio.CancelledError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            finally:
+                if not stream_reservation_done:
+                    await _release_reservation(reservation)
+
+        return StreamingResponse(
+            _stream_fanout(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", **rate_limit_headers},
+        )
+
+    try:
+        aggregate = await _collect_ordered_response()
+        if aggregate.error_envelope is not None:
+            await _release_reservation(reservation)
+            reservation_done = True
+            return _logged_error_json_response(
+                request,
+                aggregate.status_code or _status_for_image_error_envelope(aggregate.error_envelope),
+                aggregate.error_envelope,
+                headers=rate_limit_headers,
+            )
+        assert aggregate.image_response is not None
+        images_result = aggregate.image_response
+        await _finalize_image_reservation(
+            reservation,
+            model=public_model,
+            input_tokens=images_result.usage.input_tokens if images_result.usage is not None else None,
+            output_tokens=images_result.usage.output_tokens if images_result.usage is not None else None,
+            cached_input_tokens=images_service_module.image_usage_cached_input_tokens(images_result.usage),
+        )
+        reservation_done = True
+        return JSONResponse(
+            content=images_result.model_dump(mode="json", exclude_none=True),
+            headers=rate_limit_headers,
+        )
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    finally:
+        if not reservation_done:
+            await _release_reservation(reservation)
+
+
 async def _proxy_images_edit_request(
     *,
     request: Request,
@@ -1076,6 +1312,7 @@ async def _proxy_images_edit_request(
         openai_cache_affinity=True,
         api_key=api_key,
         api_key_reservation=None,
+        image_generation_admission=True,
     )
 
     captured: dict[str, object] = {}

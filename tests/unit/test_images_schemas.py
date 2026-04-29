@@ -180,6 +180,7 @@ def _validate_default(**overrides: object) -> None:
         "partial_images": None,
         "output_compression": 100,
         "images_max_partial_images": 3,
+        "images_max_n": 4,
     }
     kwargs.update(overrides)
     validate_image_request_parameters(**kwargs)  # type: ignore[arg-type]
@@ -194,12 +195,8 @@ class TestValidateImageRequestParameters:
             _validate_default(model="gpt-5.2")
         assert excinfo.value.param == "model"
 
-    @pytest.mark.parametrize("n,expect_ok", [(1, True), (0, False), (2, False), (5, False)])
+    @pytest.mark.parametrize("n,expect_ok", [(1, True), (4, True), (0, False), (5, False)])
     def test_n_bounds(self, n: int, expect_ok: bool) -> None:
-        """``n`` is hard-capped at 1 today regardless of ``images_max_n``
-        because client-side fan-out is not implemented yet. The cap is
-        relaxed in the same change that introduces fan-out.
-        """
         if expect_ok:
             _validate_default(n=n)
         else:
@@ -207,12 +204,14 @@ class TestValidateImageRequestParameters:
                 _validate_default(n=n)
             assert excinfo.value.param == "n"
 
-    def test_n_greater_than_one_is_unconditionally_rejected(self) -> None:
-        """There is no operator-tunable knob that can promote silent drop:
-        ``n > 1`` is hard-rejected as long as fan-out is unimplemented.
-        """
+    def test_n_above_configured_cap_is_rejected(self) -> None:
         with pytest.raises(ClientPayloadError) as excinfo:
-            _validate_default(n=2)
+            _validate_default(n=5, images_max_n=4)
+        assert excinfo.value.param == "n"
+
+    def test_edits_can_keep_single_image_cap(self) -> None:
+        with pytest.raises(ClientPayloadError) as excinfo:
+            _validate_default(n=2, images_max_n=1, is_edit=True)
         assert excinfo.value.param == "n"
 
     @pytest.mark.parametrize(

@@ -189,11 +189,10 @@ class Settings(BaseSettings):
     images_host_model: str = "gpt-5.5"
     images_default_model: str = "gpt-image-2"
     images_max_partial_images: int = Field(default=3, ge=0, le=3)
-    # NOTE: there is intentionally no ``images_max_n`` setting. The
-    # upstream ``image_generation`` tool path accepts only a single
-    # image per call and codex-lb does not yet implement client-side
-    # fan-out, so ``n > 1`` is hard-rejected at the API boundary. The
-    # cap is lifted in the same change that introduces fan-out.
+    images_max_n: int = Field(default=4, ge=1, le=10)
+    images_request_parallelism: int = Field(default=4, ge=1)
+    images_global_in_flight: int = Field(default=8, ge=0)
+    images_per_account_in_flight: int = Field(default=1, ge=0)
     model_registry_enabled: bool = True
     model_registry_refresh_interval_seconds: int = Field(default=300, gt=0)
     model_registry_client_version: str = "0.101.0"

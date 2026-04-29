@@ -164,6 +164,7 @@ def validate_image_request_parameters(
     partial_images: int | None,
     output_compression: int,
     images_max_partial_images: int,
+    images_max_n: int,
 ) -> None:
     """Apply the cross-field per-model validation matrix.
 
@@ -176,20 +177,9 @@ def validate_image_request_parameters(
             param="model",
         )
 
-    # ``n`` is unconditionally capped at 1: the upstream
-    # ``image_generation`` tool accepts only a single image per call and
-    # codex-lb does not yet implement client-side fan-out (multiple
-    # internal Responses calls whose ``image_generation_call`` results
-    # are concatenated into one public envelope). The cap will be
-    # relaxed in the same change that introduces fan-out, alongside a
-    # new configuration knob; we deliberately do not expose a
-    # ``images_max_n`` setting today since honoring it without fan-out
-    # would silently return fewer images than requested.
-    if n < 1 or n > 1:
+    if n < 1 or n > images_max_n:
         raise _images_invalid(
-            "n must be 1; multiple images per request are not supported by the "
-            "upstream image_generation tool yet. Issue the request multiple "
-            "times to get more images.",
+            f"n must be between 1 and {images_max_n}",
             param="n",
         )
 

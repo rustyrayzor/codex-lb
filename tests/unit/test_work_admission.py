@@ -111,3 +111,47 @@ async def test_admission_lease_none_semaphore_is_noop() -> None:
         pass
     del lease
     gc.collect()
+
+
+@pytest.mark.asyncio
+async def test_image_generation_per_account_admission_isolated_by_account() -> None:
+    controller = WorkAdmissionController(
+        token_refresh_limit=0,
+        websocket_connect_limit=0,
+        response_create_limit=0,
+        compact_response_create_limit=0,
+        image_global_in_flight=0,
+        image_per_account_in_flight=1,
+        admission_wait_timeout_seconds=0.1,
+    )
+
+    first = await controller.acquire_image_generation("acct-a")
+    other_account = await controller.acquire_image_generation("acct-b")
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await controller.acquire_image_generation("acct-a")
+
+    first.release()
+    other_account.release()
+    assert exc_info.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_image_generation_global_admission_limits_all_accounts() -> None:
+    controller = WorkAdmissionController(
+        token_refresh_limit=0,
+        websocket_connect_limit=0,
+        response_create_limit=0,
+        compact_response_create_limit=0,
+        image_global_in_flight=1,
+        image_per_account_in_flight=0,
+        admission_wait_timeout_seconds=0.1,
+    )
+
+    first = await controller.acquire_image_generation("acct-a")
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await controller.acquire_image_generation("acct-b")
+
+    first.release()
+    assert exc_info.value.status_code == 429
