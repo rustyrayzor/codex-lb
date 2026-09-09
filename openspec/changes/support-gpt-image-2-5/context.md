@@ -1,6 +1,14 @@
 # Investigation and implementation evidence
 
-Date: September 8, 2026. No production restart, deployment, account change, or credential change was performed.
+Date: September 8, 2026. Initial investigation was read-only; the user subsequently authorized push, deployment, and testing. No account or credential changes were performed.
+
+## Production rollout
+
+Both Oracle services were updated through Coolify to `codexlb-native-images:1.22.0-20260908` with `pull_policy: never`, image `sha256:efd8c8d039621809dcdcc17990ec24c0808ec976c27156ad2449d28cd9f4a13e`. Build this local image on a replacement host with `docker build -t codexlb-native-images:1.22.0-20260908 openspec/changes/support-gpt-image-2-5`; the Dockerfile verifies the four upstream source checksums before applying the patch over the pinned official 1.22.0 digest. The older root Dockerfile is not the rollout artifact.
+
+Both databases passed integrity checks after restart and retained their accounts and migration heads. Existing volumes remained attached. Each data volume contains a pre-patch backup under `backups/native-images-20260908`; original service definitions are saved in the approved host secret backup directory. Restoring those definitions through Coolify provides rollback without schema changes.
+
+The shared deployed gateway generated a PNG through Lumina's configured production connection with alpha extrema 0–255. The dedicated account still requires reauthentication; its successful model listing does not prove generation capacity. An isolated container of the deployed Lumina image also generated and served a transparent PNG through the live gateway. Its first Flare edit returned an opaque RGB checkerboard despite the transparency request. A second edit requesting Sunburst and explicitly prohibiting a checkerboard also failed alpha validation. Record both as output failures, not passing transparency tests; generation/edit request fields and byte preservation are covered separately by adapter tests. Exact model, quality, and size control remain unverified.
 
 The Images API allowlist rejected the two GPT Image 2.5 IDs locally. The Responses adapter preserved tool model and background fields, but OpenAI's configured `/backend-api/codex/responses` endpoint directly returned HTTP 400, `Transparent background is not supported for this model`, for both IDs. This reproduced with CodexLB validation bypassed.
 

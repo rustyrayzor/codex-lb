@@ -6,4 +6,5 @@
 - [x] Trace the live Responses transparency rejection to its source.
 - [x] Verify real transparent generation and editing through an isolated patched process.
 - [ ] Establish effective Sunburst/Flare selection and requested-size semantics at the upstream native endpoint.
-- [ ] Verify the deployed-version routed transport and intended origins before deployment or archival.
+- [x] Deploy the version-matched patch through Coolify and verify transport, health, storage, and both origins' account state.
+- [ ] Resolve native edit transparency reliability: both rollout edit probes returned opaque output despite requesting alpha.
