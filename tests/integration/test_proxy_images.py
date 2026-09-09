@@ -14,7 +14,10 @@ import json
 from typing import Any, cast
 
 import pytest
+from aiohttp import ClientSession, web
+from aiohttp.test_utils import TestServer
 
+import app.core.clients.proxy as core_proxy
 import app.modules.proxy.service as proxy_module
 from app.core.config.settings import Settings
 from app.db.models import DashboardSettings
@@ -100,6 +103,138 @@ def _disable_http_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 # /v1/images/generations
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare"])
+@pytest.mark.parametrize("is_edit", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_native_images_http_transport(async_client, monkeypatch, model, is_edit, streaming):
+    await _import_account(async_client, "acc_native", "native@example.com")
+    calls = []
+
+    async def endpoint(request):
+        body = await request.json()
+        calls.append(request.path)
+        assert body["model"] == model
+        assert body["background"] == "transparent"
+        assert body["output_format"] == "png"
+        assert body["quality"] == "max"
+        assert body["prompt"] == "a ribbon"
+        assert "tools" not in body
+        assert request.headers["Authorization"] == "Bearer access-token"
+        if is_edit:
+            assert body["images"] == [{"image_url": "data:image/png;base64,c291cmNl"}]
+        return web.json_response(
+            {
+                "created": 123,
+                "data": [{"b64_json": "exact-native-png"}],
+                "background": "transparent",
+                "output_format": "png",
+                "usage": {"input_tokens": 15, "output_tokens": 30, "total_tokens": 45},
+            }
+        )
+
+    application = web.Application()
+    operation = "edits" if is_edit else "generations"
+    application.router.add_post(f"/codex/images/{operation}", endpoint)
+    async with TestServer(application) as server, ClientSession() as session:
+
+        async def stream(payload, headers, access_token, account_id, **kwargs):
+            async for event in core_proxy.stream_responses(
+                payload,
+                headers,
+                access_token,
+                account_id,
+                base_url=str(server.make_url("")),
+                session=session,
+                raise_for_status=True,
+            ):
+                yield event
+
+        async def fresh(self, account, **kwargs):
+            return account
+
+        monkeypatch.setattr(proxy_module, "core_stream_responses", stream)
+        monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fresh)
+        options = {
+            "model": model,
+            "prompt": "a ribbon",
+            "quality": "max",
+            "background": "transparent",
+            "output_format": "png",
+            "stream": streaming,
+        }
+        if is_edit:
+            options["stream"] = str(streaming).lower()
+            response = await async_client.post(
+                "/v1/images/edits", data=options, files={"image": ("source.png", b"source", "image/png")}
+            )
+        else:
+            response = await async_client.post("/v1/images/generations", json=options)
+        assert response.status_code == 200, response.text
+        assert calls == [f"/codex/images/{operation}"]
+        if streaming:
+            prefix = "image_edit" if is_edit else "image_generation"
+            assert f"{prefix}.completed" in response.text
+            assert "exact-native-png" in response.text
+        else:
+            assert response.json()["data"][0]["b64_json"] == "exact-native-png"
+            assert response.json()["usage"]["total_tokens"] == 45
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare"])
+@pytest.mark.parametrize("is_edit", [False, True])
+async def test_gpt_image_25_routes_preserve_native_transparency(async_client, monkeypatch, model, is_edit):
+    await _import_account(async_client, "acc_image_25", "image-25@example.com")
+
+    async def fake_stream(payload, headers, access_token, account_id, **kwargs):
+        tool = payload.to_payload()["tools"][0]
+        assert tool["model"] == model
+        assert tool["background"] == "transparent"
+        assert tool["output_format"] == "png"
+        assert tool["quality"] == "max"
+        assert tool["size"] == "2560x3072"
+        yield _sse(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "image_generation_call",
+                    "id": "ig_25",
+                    "status": "completed",
+                    "result": "transparent-png-fixture",
+                    "background": "transparent",
+                    "output_format": "png",
+                },
+            }
+        )
+        yield _sse({"type": "response.completed", "response": {"id": "resp_25", "status": "completed"}})
+
+    async def fake_ensure_fresh(self, account, **kwargs):
+        return account
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh)
+    options = {
+        "model": model,
+        "prompt": "a translucent ribbon",
+        "background": "transparent",
+        "output_format": "png",
+        "quality": "max",
+        "size": "2560x3072",
+    }
+    if is_edit:
+        response = await async_client.post(
+            "/v1/images/edits",
+            data=options,
+            files={"image": ("source.png", b"source", "image/png")},
+        )
+    else:
+        response = await async_client.post("/v1/images/generations", json=options)
+    assert response.status_code == 200, response.text
+    assert response.json()["data"][0]["b64_json"] == "transparent-png-fixture"
 
 
 @pytest.mark.asyncio

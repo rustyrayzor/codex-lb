@@ -5,8 +5,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
+from app.core.openai.images import NativeImageRequest
 from app.core.types import JsonObject, JsonValue
 from app.core.utils.json_guards import is_json_list, is_json_mapping
 
@@ -419,6 +420,9 @@ class ResponsesTextControls(BaseModel):
 
 class ResponsesRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+    # Internal-only Images adapter context. Never accepted from or serialized to clients.
+    _native_image_request: NativeImageRequest | None = PrivateAttr(default=None)
 
     model: str = Field(min_length=1)
     instructions: str

@@ -24,12 +24,14 @@ from app.core.config.settings import get_settings
 from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.images import (
+    NativeImageRequest,
     V1ImageData,
     V1ImageResponse,
     V1ImagesEditsForm,
     V1ImagesGenerationsRequest,
     V1ImageUsage,
     is_supported_image_model,
+    uses_native_image_transport,
     validate_image_request_parameters,
 )
 from app.core.openai.requests import ResponsesRequest
@@ -191,7 +193,7 @@ def images_generation_to_responses_request(
         input_fidelity=None,
         streaming=streaming,
     )
-    return ResponsesRequest.model_validate(
+    request = ResponsesRequest.model_validate(
         {
             "model": host_model,
             "instructions": _IMAGE_GENERATION_INSTRUCTIONS,
@@ -206,6 +208,9 @@ def images_generation_to_responses_request(
             "store": False,
         }
     )
+    if uses_native_image_transport(payload.model):
+        request._native_image_request = NativeImageRequest("generations", _native_image_body(payload))
+    return request
 
 
 def images_edit_to_responses_request(
@@ -227,6 +232,8 @@ def images_edit_to_responses_request(
         # Caller is expected to validate this beforehand, but guard so we
         # never silently produce an image-less Responses request.
         raise ValueError("/v1/images/edits requires at least one image part")
+    if mask is not None and payload.model is not None and uses_native_image_transport(payload.model):
+        raise ClientPayloadError("Explicit masks are not supported by the native image adapter.", param="mask")
 
     streaming = bool(payload.stream)
     attached: list[dict[str, JsonValue]] = []
@@ -257,7 +264,7 @@ def images_edit_to_responses_request(
         streaming=streaming,
         is_edit=True,
     )
-    return ResponsesRequest.model_validate(
+    request = ResponsesRequest.model_validate(
         {
             "model": host_model,
             "instructions": _IMAGE_GENERATION_INSTRUCTIONS,
@@ -276,6 +283,25 @@ def images_edit_to_responses_request(
             "store": False,
         }
     )
+    if uses_native_image_transport(payload.model):
+        body = _native_image_body(payload)
+        body["images"] = [{"image_url": part["image_url"]} for part in attached]
+        request._native_image_request = NativeImageRequest("edits", body)
+    return request
+
+
+def _native_image_body(payload: V1ImagesGenerationsRequest | V1ImagesEditsForm) -> dict[str, JsonValue]:
+    return {
+        "model": payload.model,
+        "prompt": payload.prompt,
+        "n": payload.n,
+        "size": payload.size,
+        "quality": payload.quality,
+        "background": payload.background,
+        "output_format": payload.output_format,
+        "output_compression": payload.output_compression,
+        "moderation": payload.moderation,
+    }
 
 
 # ---------------------------------------------------------------------------

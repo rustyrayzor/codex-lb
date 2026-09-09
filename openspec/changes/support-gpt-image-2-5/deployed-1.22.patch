@@ -1,0 +1,452 @@
+--- a/app/core/clients/proxy.py
++++ b/app/core/clients/proxy.py
+@@ -35,8 +35,6 @@
+ from aiohttp import hdrs
+ from aiohttp.client_ws import DEFAULT_WS_CLIENT_TIMEOUT, WebSocketDataQueue
+ from aiohttp.http_websocket import WS_KEY, WebSocketReader, WebSocketWriter
+-from multidict import CIMultiDict
+-
+ from app.core.clients.codex import (
+     CodexClient,
+     CodexTransportError,
+@@ -44,6 +42,18 @@
+     create_codex_session,
+     require_route_or_direct_egress_opt_in,
+ )
++from app.core.resilience.network_recovery import (
++    PROCESS_NETWORK_UNAVAILABLE_CODE,
++    is_pre_dispatch_connection_failure,
++    is_process_network_failure,
++    is_proxy_endpoint_failure,
++    process_network_error_code,
++)
++from app.core.upstream_proxy import ResolvedUpstreamRoute
++from app.core.usage.live_hub import publish_live_usage
++from app.core.usage.live_snapshots import EVENT_MARKER, parse_rate_limit_event_text, parse_rate_limit_headers
++from multidict import CIMultiDict
++
+ from app.core.clients.codex_version import get_codex_version_cache
+ from app.core.clients.http import acquire_http_client, lease_http_session
+ from app.core.config.settings import Settings, get_settings
+@@ -58,6 +68,7 @@
+ from app.core.openai.exceptions import ClientPayloadError
+ from app.core.openai.model_registry import get_model_registry
+ from app.core.openai.models import CompactResponsePayload, OpenAIError
++from app.core.openai.native_images import native_image_response_events
+ from app.core.openai.parsing import (
+     parse_compact_response_payload,
+     parse_error_payload,
+@@ -74,17 +85,7 @@
+     _is_server_error,
+     get_circuit_breaker_for_account,
+ )
+-from app.core.resilience.network_recovery import (
+-    PROCESS_NETWORK_UNAVAILABLE_CODE,
+-    is_pre_dispatch_connection_failure,
+-    is_process_network_failure,
+-    is_proxy_endpoint_failure,
+-    process_network_error_code,
+-)
+ from app.core.types import JsonObject, JsonValue
+-from app.core.upstream_proxy import ResolvedUpstreamRoute
+-from app.core.usage.live_hub import publish_live_usage
+-from app.core.usage.live_snapshots import EVENT_MARKER, parse_rate_limit_event_text, parse_rate_limit_headers
+ from app.core.utils.json_guards import is_json_mapping
+ from app.core.utils.request_id import get_request_id
+ from app.core.utils.sse import format_sse_event, parse_sse_data_json
+@@ -2677,6 +2678,9 @@
+     )
+     if route is None and route_trace is not None:
+         route_trace.record_direct()
++    native_image_request = payload._native_image_request
++    if native_image_request is not None:
++        url = f"{upstream_base}/codex/images/{native_image_request.operation}"
+     pre_request_started_at = time.monotonic()
+     # Keep a default total timeout so direct callers cannot hang forever before
+     # response headers or the first SSE event. Responses streams can run much
+@@ -2703,9 +2707,10 @@
+     failure_exception_type: str | None = None
+     retryable_same_contract: bool | None = None
+     client_session = session
+-    payload_dict = dict(payload.to_payload())
+-    apply_codex_installation_metadata(payload_dict, codex_installation_id)
+-    if settings.image_inline_fetch_enabled:
++    payload_dict = dict(native_image_request.body if native_image_request is not None else payload.to_payload())
++    if native_image_request is None:
++        apply_codex_installation_metadata(payload_dict, codex_installation_id)
++    if native_image_request is None and settings.image_inline_fetch_enabled:
+         payload_dict = await _inline_input_image_urls(
+             payload_dict,
+             _as_image_fetch_session(client_session),
+@@ -2738,6 +2743,9 @@
+         has_image_generation_tool=_payload_uses_image_generation_tool(payload_dict),
+         payload_size_estimate_bytes=payload_size_estimate_bytes,
+     )
++    if native_image_request is not None:
++        transport = "http"
++        transport_mode = "http"
+     payload_dict = websocket_payload_dict if transport == "websocket" else http_payload_dict
+     payload_json = json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
+     if transport == "websocket":
+@@ -2747,6 +2755,8 @@
+         upstream_headers = _build_upstream_headers(headers, access_token, account_id)
+         _apply_responses_lite_http_header(upstream_headers, payload_dict)
+         method = "POST"
++        if native_image_request is not None:
++            upstream_headers["Accept"] = "application/json"
+     upstream_headers = apply_codex_installation_headers(upstream_headers, codex_installation_id)
+     remaining_request_timeout = _remaining_total_timeout(
+         request_total_timeout,
+@@ -2774,7 +2784,7 @@
+                     "json": payload_dict,
+                     "headers": current_headers,
+                     "timeout": remaining_request_timeout or request_total_timeout,
+-                    "buffer_response": False,
++                    "buffer_response": native_image_request is not None,
+                 }
+                 request_with_metadata = getattr(active_codex_client, "request_with_route_metadata", None)
+                 if callable(request_with_metadata):
+@@ -2832,6 +2842,19 @@
+                     yield event_block
+                     return
+ 
++                if native_image_request is not None:
++                    try:
++                        native_result = await resp.json()
++                        events = native_image_response_events(native_result, host_model=payload.model)
++                    except (ValueError, TypeError) as exc:
++                        raise ProxyResponseError(
++                            502, openai_error("upstream_error", "Invalid native image response")
++                        ) from exc
++                    seen_terminal = True
++                    for event_block in events:
++                        yield event_block
++                    return
++
+                 async for event_block in _iter_sse_events(
+                     cast(SSEResponse, resp),
+                     effective_idle_timeout,
+@@ -2924,6 +2947,19 @@
+                     extra={"event_format": "sse"},
+                 )
+                 yield event_block
++                return
++
++            if native_image_request is not None:
++                try:
++                    native_result = await resp.json()
++                    events = native_image_response_events(native_result, host_model=payload.model)
++                except (ValueError, TypeError) as exc:
++                    raise ProxyResponseError(
++                        502, openai_error("upstream_error", "Invalid native image response")
++                    ) from exc
++                seen_terminal = True
++                for event_block in events:
++                    yield event_block
+                 return
+ 
+             async for event_block in _iter_sse_events(
+--- a/app/core/openai/images.py
++++ b/app/core/openai/images.py
+@@ -11,6 +11,11 @@
+ Per-model validation matrix (kept here so request validation rejects the
+ request *before* any upstream call is opened):
+ 
++- ``gpt-image-2.5-sunburst`` / ``gpt-image-2.5-flare``:
++    * Same custom dimension limits as ``gpt-image-2``.
++    * Adds ``xhigh`` and ``max`` quality.
++    * Transparent backgrounds require PNG or WebP output.
++    * ``input_fidelity`` is not supported.
+ - ``gpt-image-2`` (default):
+     * ``quality`` in ``{low, medium, high, auto}``
+     * ``size`` is either ``auto`` or ``WIDTHxHEIGHT`` where width and height
+@@ -31,24 +36,28 @@
+ from __future__ import annotations
+ 
+ import re
+-from typing import Final
++from dataclasses import dataclass
++from typing import Final, Literal
+ 
+ from pydantic import BaseModel, ConfigDict, Field, field_validator
+ 
+ from app.core.openai.exceptions import ClientPayloadError
+-from app.core.types import JsonValue
++from app.core.types import JsonObject, JsonValue
+ 
+ #: Allowed public ``gpt-image-*`` family. Any other model is rejected up-front.
+ GPT_IMAGE_MODEL_PREFIX: Final[str] = "gpt-image-"
+ 
+ #: Models that take the constrained gpt-image-2 parameter matrix.
+ _GPT_IMAGE_2_MODELS: Final[frozenset[str]] = frozenset({"gpt-image-2"})
++_GPT_IMAGE_25_MODELS: Final[frozenset[str]] = frozenset({"gpt-image-2.5-sunburst", "gpt-image-2.5-flare"})
++_CUSTOM_SIZE_MODELS: Final[frozenset[str]] = _GPT_IMAGE_2_MODELS | _GPT_IMAGE_25_MODELS
+ 
+ #: Models that take the legacy fixed-size matrix and allow ``input_fidelity``
+ #: (only on edits).
+ _LEGACY_GPT_IMAGE_MODELS: Final[frozenset[str]] = frozenset({"gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"})
+ 
+ _GPT_IMAGE_2_QUALITY: Final[frozenset[str]] = frozenset({"low", "medium", "high", "auto"})
++_GPT_IMAGE_25_QUALITY: Final[frozenset[str]] = _GPT_IMAGE_2_QUALITY | {"xhigh", "max"}
+ # ``standard`` / ``hd`` are DALL-E-only quality values and are NOT valid for
+ # any ``gpt-image-*`` model. Allowing them here would let invalid requests
+ # bypass adapter-side validation and fail later with a less deterministic
+@@ -92,8 +101,18 @@
+ 
+ def is_supported_image_model(model: str) -> bool:
+     return model.startswith(GPT_IMAGE_MODEL_PREFIX) and (
+-        model in _GPT_IMAGE_2_MODELS or model in _LEGACY_GPT_IMAGE_MODELS
++        model in _CUSTOM_SIZE_MODELS or model in _LEGACY_GPT_IMAGE_MODELS
+     )
++
++
++def uses_native_image_transport(model: str) -> bool:
++    return model in _GPT_IMAGE_25_MODELS
++
++
++@dataclass(frozen=True)
++class NativeImageRequest:
++    operation: Literal["generations", "edits"]
++    body: JsonObject
+ 
+ 
+ def validate_image_size(model: str, size: str) -> None:
+@@ -113,8 +132,8 @@
+         )
+     width = int(match.group(1))
+     height = int(match.group(2))
+-    if model in _GPT_IMAGE_2_MODELS:
+-        _validate_gpt_image_2_size(width, height)
++    if model in _CUSTOM_SIZE_MODELS:
++        _validate_custom_image_size(model, width, height)
+         return
+     # Legacy models: only the canonical fixed sizes are allowed.
+     if size not in _LEGACY_FIXED_SIZES:
+@@ -124,31 +143,30 @@
+         )
+ 
+ 
+-def _validate_gpt_image_2_size(width: int, height: int) -> None:
++def _validate_custom_image_size(model: str, width: int, height: int) -> None:
+     if width <= 0 or height <= 0:
+         raise _images_invalid("size dimensions must be positive integers", param="size")
+     if width % _GPT_IMAGE_2_DIM_MULTIPLE != 0 or height % _GPT_IMAGE_2_DIM_MULTIPLE != 0:
+         raise _images_invalid(
+-            f"size dimensions must be multiples of {_GPT_IMAGE_2_DIM_MULTIPLE} for gpt-image-2",
++            f"size dimensions must be multiples of {_GPT_IMAGE_2_DIM_MULTIPLE} for {model}",
+             param="size",
+         )
+     if max(width, height) > _GPT_IMAGE_2_MAX_EDGE:
+         raise _images_invalid(
+-            f"size edges must be <= {_GPT_IMAGE_2_MAX_EDGE} px for gpt-image-2",
++            f"size edges must be <= {_GPT_IMAGE_2_MAX_EDGE} px for {model}",
+             param="size",
+         )
+     long_edge = max(width, height)
+     short_edge = min(width, height)
+     if short_edge == 0 or (long_edge / short_edge) > _GPT_IMAGE_2_RATIO_MAX:
+         raise _images_invalid(
+-            f"size aspect ratio must be at most {int(_GPT_IMAGE_2_RATIO_MAX)}:1 for gpt-image-2",
++            f"size aspect ratio must be at most {int(_GPT_IMAGE_2_RATIO_MAX)}:1 for {model}",
+             param="size",
+         )
+     pixels = width * height
+     if pixels < _GPT_IMAGE_2_MIN_PIXELS or pixels > _GPT_IMAGE_2_MAX_PIXELS:
+         raise _images_invalid(
+-            f"size total pixels must be between {_GPT_IMAGE_2_MIN_PIXELS} and "
+-            f"{_GPT_IMAGE_2_MAX_PIXELS} for gpt-image-2",
++            f"size total pixels must be between {_GPT_IMAGE_2_MIN_PIXELS} and {_GPT_IMAGE_2_MAX_PIXELS} for {model}",
+             param="size",
+         )
+ 
+@@ -220,26 +238,36 @@
+         )
+ 
+     if partial_images is not None:
++        if uses_native_image_transport(model) and partial_images > 0:
++            raise _images_invalid(
++                "Partial previews are not supported by the native image adapter.", param="partial_images"
++            )
+         if partial_images < 0 or partial_images > _MAX_PARTIAL_IMAGES:
+             raise _images_invalid(
+                 f"partial_images must be between 0 and {_MAX_PARTIAL_IMAGES}",
+                 param="partial_images",
+             )
+ 
+-    if model in _GPT_IMAGE_2_MODELS:
+-        if quality not in _GPT_IMAGE_2_QUALITY:
+-            raise _images_invalid(
+-                f"Invalid quality '{quality}' for gpt-image-2. Expected one of: low, medium, high, auto.",
++    if model in _CUSTOM_SIZE_MODELS:
++        allowed_quality = _GPT_IMAGE_25_QUALITY if model in _GPT_IMAGE_25_MODELS else _GPT_IMAGE_2_QUALITY
++        if quality not in allowed_quality:
++            raise _images_invalid(
++                f"Invalid quality '{quality}' for {model}. Expected one of: {', '.join(sorted(allowed_quality))}.",
+                 param="quality",
+             )
+-        if background == "transparent":
++        if model in _GPT_IMAGE_2_MODELS and background == "transparent":
+             raise _images_invalid(
+                 "background='transparent' is not supported by gpt-image-2",
+                 param="background",
+             )
++        if model in _GPT_IMAGE_25_MODELS and background == "transparent" and output_format == "jpeg":
++            raise _images_invalid(
++                "Transparent backgrounds require png or webp output_format.",
++                param="output_format",
++            )
+         if input_fidelity is not None:
+             raise _images_invalid(
+-                "input_fidelity is not supported by gpt-image-2",
++                f"input_fidelity is not supported by {model}",
+                 param="input_fidelity",
+             )
+     else:
+--- a/app/core/openai/requests.py
++++ b/app/core/openai/requests.py
+@@ -5,10 +5,11 @@
+ from dataclasses import dataclass
+ from typing import cast
+ 
+-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
++from app.core.openai.tool_call_safety import is_downstream_side_effect_tool_call_item
++from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+ 
+ from app.core.openai.exceptions import ClientPayloadError
+-from app.core.openai.tool_call_safety import is_downstream_side_effect_tool_call_item
++from app.core.openai.images import NativeImageRequest
+ from app.core.types import JsonObject, JsonValue
+ from app.core.utils.json_guards import is_json_list, is_json_mapping
+ 
+@@ -612,6 +613,9 @@
+     @classmethod
+     def _move_input_instruction_messages(cls, data: JsonValue) -> JsonValue:
+         return _normalize_responses_input_instructions(data)
++
++    # Internal-only Images adapter context. Never accepted from or serialized to clients.
++    _native_image_request: NativeImageRequest | None = PrivateAttr(default=None)
+ 
+     model: str = Field(min_length=1)
+     instructions: str
+--- a/app/modules/proxy/images_service.py
++++ b/app/modules/proxy/images_service.py
+@@ -24,12 +24,14 @@
+ from app.core.errors import OpenAIErrorEnvelope, openai_error
+ from app.core.openai.exceptions import ClientPayloadError
+ from app.core.openai.images import (
++    NativeImageRequest,
+     V1ImageData,
+     V1ImageResponse,
+     V1ImagesEditsForm,
+     V1ImagesGenerationsRequest,
+     V1ImageUsage,
+     is_supported_image_model,
++    uses_native_image_transport,
+     validate_image_request_parameters,
+ )
+ from app.core.openai.requests import ResponsesRequest
+@@ -191,7 +193,7 @@
+         input_fidelity=None,
+         streaming=streaming,
+     )
+-    return ResponsesRequest.model_validate(
++    request = ResponsesRequest.model_validate(
+         {
+             "model": host_model,
+             "instructions": _IMAGE_GENERATION_INSTRUCTIONS,
+@@ -206,6 +208,9 @@
+             "store": False,
+         }
+     )
++    if uses_native_image_transport(payload.model):
++        request._native_image_request = NativeImageRequest("generations", _native_image_body(payload))
++    return request
+ 
+ 
+ def images_edit_to_responses_request(
+@@ -227,6 +232,8 @@
+         # Caller is expected to validate this beforehand, but guard so we
+         # never silently produce an image-less Responses request.
+         raise ValueError("/v1/images/edits requires at least one image part")
++    if mask is not None and payload.model is not None and uses_native_image_transport(payload.model):
++        raise ClientPayloadError("Explicit masks are not supported by the native image adapter.", param="mask")
+ 
+     streaming = bool(payload.stream)
+     attached: list[dict[str, JsonValue]] = []
+@@ -257,7 +264,7 @@
+         streaming=streaming,
+         is_edit=True,
+     )
+-    return ResponsesRequest.model_validate(
++    request = ResponsesRequest.model_validate(
+         {
+             "model": host_model,
+             "instructions": _IMAGE_GENERATION_INSTRUCTIONS,
+@@ -276,6 +283,25 @@
+             "store": False,
+         }
+     )
++    if uses_native_image_transport(payload.model):
++        body = _native_image_body(payload)
++        body["images"] = [{"image_url": part["image_url"]} for part in attached]
++        request._native_image_request = NativeImageRequest("edits", body)
++    return request
++
++
++def _native_image_body(payload: V1ImagesGenerationsRequest | V1ImagesEditsForm) -> dict[str, JsonValue]:
++    return {
++        "model": payload.model,
++        "prompt": payload.prompt,
++        "n": payload.n,
++        "size": payload.size,
++        "quality": payload.quality,
++        "background": payload.background,
++        "output_format": payload.output_format,
++        "output_compression": payload.output_compression,
++        "moderation": payload.moderation,
++    }
+ 
+ 
+ # ---------------------------------------------------------------------------
+--- /dev/null
++++ b/app/core/openai/native_images.py
+@@ -0,0 +1,39 @@
++"""Convert native Codex Images results to the proxy's internal event contract."""
++
++from uuid import uuid4
++
++from app.core.openai.images import V1ImageResponse
++from app.core.types import JsonValue
++from app.core.utils.sse import format_sse_event
++
++
++def native_image_response_events(value: JsonValue, *, host_model: str) -> list[str]:
++    result = V1ImageResponse.model_validate(value)
++    if len(result.data) != 1 or not result.data[0].b64_json:
++        raise ValueError("Native image endpoint must return exactly one non-empty image")
++    response_id = f"resp_{uuid4().hex}"
++    item: dict[str, JsonValue] = {
++        "id": f"ig_{uuid4().hex}",
++        "type": "image_generation_call",
++        "status": "completed",
++        "result": result.data[0].b64_json,
++    }
++    if isinstance(value, dict):
++        for key in ("background", "output_format", "quality", "size"):
++            if key in value:
++                item[key] = value[key]
++    response: dict[str, JsonValue] = {
++        "id": response_id,
++        "object": "response",
++        "created_at": result.created,
++        "model": host_model,
++        "status": "completed",
++        "output": [item],
++    }
++    if result.usage is not None:
++        response["tool_usage"] = {"image_gen": result.usage.model_dump(mode="json", exclude_none=True)}
++    events: list[dict[str, JsonValue]] = [
++        {"type": "response.output_item.done", "output_index": 0, "item": item},
++        {"type": "response.completed", "response": response},
++    ]
++    return [format_sse_event(event) for event in events]

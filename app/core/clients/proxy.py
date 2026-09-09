@@ -47,6 +47,7 @@ from app.core.errors import (
 )
 from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import CompactResponsePayload, OpenAIError
+from app.core.openai.native_images import native_image_response_events
 from app.core.openai.parsing import (
     parse_compact_response_payload,
     parse_error_payload,
@@ -1897,6 +1898,9 @@ async def stream_responses(
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
     url = f"{upstream_base}/codex/responses"
+    native_image_request = payload._native_image_request
+    if native_image_request is not None:
+        url = f"{upstream_base}/codex/images/{native_image_request.operation}"
     pre_request_started_at = time.monotonic()
     # Keep a default total timeout so direct callers cannot hang forever before
     # response headers or the first SSE event. ProxyService stream attempts clamp
@@ -1914,8 +1918,8 @@ async def stream_responses(
     error_code: str | None = None
     error_message: str | None = None
     client_session = session or get_http_client().session
-    payload_dict = payload.to_payload()
-    if settings.image_inline_fetch_enabled:
+    payload_dict = native_image_request.body if native_image_request is not None else payload.to_payload()
+    if native_image_request is None and settings.image_inline_fetch_enabled:
         payload_dict = await _inline_input_image_urls(
             payload_dict,
             _as_image_fetch_session(client_session),
@@ -1936,12 +1940,17 @@ async def stream_responses(
         has_image_generation_tool=_payload_uses_image_generation_tool(payload_dict),
         payload_size_estimate_bytes=payload_size_estimate_bytes,
     )
+    if native_image_request is not None:
+        transport = "http"
+        transport_mode = "http"
     if transport == "websocket":
         upstream_headers = _build_upstream_websocket_headers(headers, access_token, account_id)
         method = "GET"
     else:
         upstream_headers = _build_upstream_headers(headers, access_token, account_id)
         method = "POST"
+        if native_image_request is not None:
+            upstream_headers["Accept"] = "application/json"
     remaining_request_timeout = _remaining_total_timeout(
         request_total_timeout,
         pre_request_started_at,
@@ -2004,6 +2013,19 @@ async def stream_responses(
                     extra={"event_format": "sse"},
                 )
                 yield event_block
+                return
+
+            if native_image_request is not None:
+                try:
+                    native_result = await resp.json()
+                    events = native_image_response_events(native_result, host_model=payload.model)
+                except (ValueError, TypeError) as exc:
+                    raise ProxyResponseError(
+                        502, openai_error("upstream_error", "Invalid native image response")
+                    ) from exc
+                seen_terminal = True
+                for event_block in events:
+                    yield event_block
                 return
 
             async for event_block in _iter_sse_events(

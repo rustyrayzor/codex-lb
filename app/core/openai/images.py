@@ -4,13 +4,18 @@ These schemas describe the *public* surface that codex-lb exposes. They mirror
 the OpenAI Images API request shape so SDKs (e.g. ``openai`` Python client,
 the codex CLI image fallback) can target codex-lb without modification.
 
-The endpoints themselves are implemented as a thin translation layer over
-``/v1/responses`` with the built-in ``image_generation`` tool — see
-``app.modules.proxy.images_service``.
+The endpoints reuse the Responses service lifecycle. GPT Image 2.5 uses the
+dedicated Codex Images transport; older models use the Responses image tool.
+See ``app.modules.proxy.images_service``.
 
 Per-model validation matrix (kept here so request validation rejects the
 request *before* any upstream call is opened):
 
+- ``gpt-image-2.5-sunburst`` / ``gpt-image-2.5-flare``:
+    * Same custom dimension limits as ``gpt-image-2``.
+    * Adds ``xhigh`` and ``max`` quality.
+    * Transparent backgrounds require PNG or WebP output.
+    * ``input_fidelity`` is not supported.
 - ``gpt-image-2`` (default):
     * ``quality`` in ``{low, medium, high, auto}``
     * ``size`` is either ``auto`` or ``WIDTHxHEIGHT`` where width and height
@@ -31,24 +36,28 @@ request *before* any upstream call is opened):
 from __future__ import annotations
 
 import re
-from typing import Final
+from dataclasses import dataclass
+from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.core.openai.exceptions import ClientPayloadError
-from app.core.types import JsonValue
+from app.core.types import JsonObject, JsonValue
 
 #: Allowed public ``gpt-image-*`` family. Any other model is rejected up-front.
 GPT_IMAGE_MODEL_PREFIX: Final[str] = "gpt-image-"
 
 #: Models that take the constrained gpt-image-2 parameter matrix.
 _GPT_IMAGE_2_MODELS: Final[frozenset[str]] = frozenset({"gpt-image-2"})
+_GPT_IMAGE_25_MODELS: Final[frozenset[str]] = frozenset({"gpt-image-2.5-sunburst", "gpt-image-2.5-flare"})
+_CUSTOM_SIZE_MODELS: Final[frozenset[str]] = _GPT_IMAGE_2_MODELS | _GPT_IMAGE_25_MODELS
 
 #: Models that take the legacy fixed-size matrix and allow ``input_fidelity``
 #: (only on edits).
 _LEGACY_GPT_IMAGE_MODELS: Final[frozenset[str]] = frozenset({"gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"})
 
 _GPT_IMAGE_2_QUALITY: Final[frozenset[str]] = frozenset({"low", "medium", "high", "auto"})
+_GPT_IMAGE_25_QUALITY: Final[frozenset[str]] = _GPT_IMAGE_2_QUALITY | {"xhigh", "max"}
 # ``standard`` / ``hd`` are DALL-E-only quality values and are NOT valid for
 # any ``gpt-image-*`` model. Allowing them here would let invalid requests
 # bypass adapter-side validation and fail later with a less deterministic
@@ -89,8 +98,18 @@ def _images_invalid(
 
 def is_supported_image_model(model: str) -> bool:
     return model.startswith(GPT_IMAGE_MODEL_PREFIX) and (
-        model in _GPT_IMAGE_2_MODELS or model in _LEGACY_GPT_IMAGE_MODELS
+        model in _CUSTOM_SIZE_MODELS or model in _LEGACY_GPT_IMAGE_MODELS
     )
+
+
+def uses_native_image_transport(model: str) -> bool:
+    return model in _GPT_IMAGE_25_MODELS
+
+
+@dataclass(frozen=True)
+class NativeImageRequest:
+    operation: Literal["generations", "edits"]
+    body: JsonObject
 
 
 def validate_image_size(model: str, size: str) -> None:
@@ -110,8 +129,8 @@ def validate_image_size(model: str, size: str) -> None:
         )
     width = int(match.group(1))
     height = int(match.group(2))
-    if model in _GPT_IMAGE_2_MODELS:
-        _validate_gpt_image_2_size(width, height)
+    if model in _CUSTOM_SIZE_MODELS:
+        _validate_custom_image_size(model, width, height)
         return
     # Legacy models: only the canonical fixed sizes are allowed.
     if size not in _LEGACY_FIXED_SIZES:
@@ -121,31 +140,30 @@ def validate_image_size(model: str, size: str) -> None:
         )
 
 
-def _validate_gpt_image_2_size(width: int, height: int) -> None:
+def _validate_custom_image_size(model: str, width: int, height: int) -> None:
     if width <= 0 or height <= 0:
         raise _images_invalid("size dimensions must be positive integers", param="size")
     if width % _GPT_IMAGE_2_DIM_MULTIPLE != 0 or height % _GPT_IMAGE_2_DIM_MULTIPLE != 0:
         raise _images_invalid(
-            f"size dimensions must be multiples of {_GPT_IMAGE_2_DIM_MULTIPLE} for gpt-image-2",
+            f"size dimensions must be multiples of {_GPT_IMAGE_2_DIM_MULTIPLE} for {model}",
             param="size",
         )
     if max(width, height) > _GPT_IMAGE_2_MAX_EDGE:
         raise _images_invalid(
-            f"size edges must be <= {_GPT_IMAGE_2_MAX_EDGE} px for gpt-image-2",
+            f"size edges must be <= {_GPT_IMAGE_2_MAX_EDGE} px for {model}",
             param="size",
         )
     long_edge = max(width, height)
     short_edge = min(width, height)
     if short_edge == 0 or (long_edge / short_edge) > _GPT_IMAGE_2_RATIO_MAX:
         raise _images_invalid(
-            f"size aspect ratio must be at most {int(_GPT_IMAGE_2_RATIO_MAX)}:1 for gpt-image-2",
+            f"size aspect ratio must be at most {int(_GPT_IMAGE_2_RATIO_MAX)}:1 for {model}",
             param="size",
         )
     pixels = width * height
     if pixels < _GPT_IMAGE_2_MIN_PIXELS or pixels > _GPT_IMAGE_2_MAX_PIXELS:
         raise _images_invalid(
-            f"size total pixels must be between {_GPT_IMAGE_2_MIN_PIXELS} and "
-            f"{_GPT_IMAGE_2_MAX_PIXELS} for gpt-image-2",
+            f"size total pixels must be between {_GPT_IMAGE_2_MIN_PIXELS} and {_GPT_IMAGE_2_MAX_PIXELS} for {model}",
             param="size",
         )
 
@@ -218,26 +236,36 @@ def validate_image_request_parameters(
         )
 
     if partial_images is not None:
+        if uses_native_image_transport(model) and partial_images > 0:
+            raise _images_invalid(
+                "Partial previews are not supported by the native image adapter.", param="partial_images"
+            )
         if partial_images < 0 or partial_images > images_max_partial_images:
             raise _images_invalid(
                 f"partial_images must be between 0 and {images_max_partial_images}",
                 param="partial_images",
             )
 
-    if model in _GPT_IMAGE_2_MODELS:
-        if quality not in _GPT_IMAGE_2_QUALITY:
+    if model in _CUSTOM_SIZE_MODELS:
+        allowed_quality = _GPT_IMAGE_25_QUALITY if model in _GPT_IMAGE_25_MODELS else _GPT_IMAGE_2_QUALITY
+        if quality not in allowed_quality:
             raise _images_invalid(
-                f"Invalid quality '{quality}' for gpt-image-2. Expected one of: low, medium, high, auto.",
+                f"Invalid quality '{quality}' for {model}. Expected one of: {', '.join(sorted(allowed_quality))}.",
                 param="quality",
             )
-        if background == "transparent":
+        if model in _GPT_IMAGE_2_MODELS and background == "transparent":
             raise _images_invalid(
                 "background='transparent' is not supported by gpt-image-2",
                 param="background",
             )
+        if model in _GPT_IMAGE_25_MODELS and background == "transparent" and output_format == "jpeg":
+            raise _images_invalid(
+                "Transparent backgrounds require png or webp output_format.",
+                param="output_format",
+            )
         if input_fidelity is not None:
             raise _images_invalid(
-                "input_fidelity is not supported by gpt-image-2",
+                f"input_fidelity is not supported by {model}",
                 param="input_fidelity",
             )
     else:
