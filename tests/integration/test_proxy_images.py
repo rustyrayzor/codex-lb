@@ -20,6 +20,7 @@ from aiohttp.test_utils import TestServer
 import app.core.clients.proxy as core_proxy
 import app.modules.proxy.service as proxy_module
 from app.core.config.settings import Settings
+from app.core.openai.model_registry import get_model_registry
 from app.db.models import DashboardSettings
 
 pytestmark = pytest.mark.integration
@@ -111,6 +112,11 @@ def _disable_http_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_native_images_http_transport(async_client, monkeypatch, model, is_edit, streaming):
     await _import_account(async_client, "acc_native", "native@example.com")
+    monkeypatch.setattr(
+        get_model_registry(),
+        "plan_types_for_model",
+        lambda slug: frozenset({"plus"}) if slug == "gpt-6.1-sol" else frozenset(),
+    )
     calls = []
 
     async def endpoint(request):
@@ -141,6 +147,7 @@ async def test_native_images_http_transport(async_client, monkeypatch, model, is
     async with TestServer(application) as server, ClientSession() as session:
 
         async def stream(payload, headers, access_token, account_id, **kwargs):
+            assert payload.model == "gpt-6.1-sol"
             async for event in core_proxy.stream_responses(
                 payload,
                 headers,
@@ -368,7 +375,7 @@ async def test_images_generations_returns_envelope_on_success(async_client, monk
     assert body["usage"] == {"input_tokens": 7, "output_tokens": 13, "total_tokens": 20}
 
     # The host model is hidden from clients but appears in the upstream call.
-    assert captured["model"] == "gpt-5.5"
+    assert captured["model"] == "gpt-6.1-sol"
     tools = cast(list[Any], captured["tools"])
     image_tool = cast(dict[str, Any], tools[0])
     assert image_tool["type"] == "image_generation"
