@@ -192,7 +192,7 @@ class Settings(BaseSettings):
     # built-in ``image_generation`` tool. It is never echoed to clients.
     # ``images_default_model`` is the public model returned to clients when
     # they omit ``model``; it must remain in the ``gpt-image-*`` family.
-    images_host_model: str = "gpt-5.5"
+    images_host_model: str = "gpt-6.1-sol"
     images_default_model: str = "gpt-image-2"
     images_max_partial_images: int = Field(default=3, ge=0, le=3)
     # NOTE: there is intentionally no ``images_max_n`` setting. The
